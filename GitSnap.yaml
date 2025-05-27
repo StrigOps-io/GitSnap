@@ -1,0 +1,538 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Creates GitHub OIDC integration for repository backup storage to S3 with lifecycle policies.
+  Storage classes and retention policies configurable per requirements.
+
+Parameters:
+  GitHubRepositoryName:
+    Type: String
+    Description: Name of the GitHub repository to grant access (e.g., 'my-org/my-repo')
+    AllowedPattern: ^[a-zA-Z0-9-_.]+/[a-zA-Z0-9-_.]+$
+    ConstraintDescription: Must be in the format 'owner/repo'
+
+  ThumbprintList:
+    Type: CommaDelimitedList
+    Description: Thumbprint(s) of the GitHub OIDC provider
+    Default: 6938fd4d98bab03faadb97b34396831e3780aea1,1c58a3a8518e8759bf075b76b750d4f2df264fcd
+
+  AudienceList:
+    Type: CommaDelimitedList
+    Description: Audience values to use for OIDC provider
+    Default: sts.amazonaws.com
+
+  DailyBackupRetentionDays:
+    Type: Number
+    Description: Number of days to retain daily backups
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+
+  WeeklyBackupRetentionDays:
+    Type: Number
+    Description: Number of days to retain weekly backups
+    Default: 365
+    MinValue: 1
+    MaxValue: 3650
+
+  S3StorageClass:
+    Type: String
+    Description: S3 storage class for backup data
+    Default: GLACIER_IR
+    AllowedValues:
+      - STANDARD
+      - INTELLIGENT_TIERING
+      - ONEZONE_IA
+      - STANDARD_IA
+      - GLACIER
+      - GLACIER_IR
+      - DEEP_ARCHIVE
+
+Resources:
+  # IAM Role for the OIDC Provider Lambda function
+  OIDCLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: OIDCManagement
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:CreateOpenIDConnectProvider
+                  - iam:GetOpenIDConnectProvider
+                  - iam:ListOpenIDConnectProviders
+                  - iam:UpdateOpenIDConnectProviderThumbprint
+                  - iam:AddClientIDToOpenIDConnectProvider
+                Resource: "*"
+
+  GitHubOIDCProviderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: nodejs22.x
+      Role: !GetAtt OIDCLambdaRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          const { IAMClient, ListOpenIDConnectProvidersCommand, GetOpenIDConnectProviderCommand, CreateOpenIDConnectProviderCommand } = require('@aws-sdk/client-iam');
+          const iamClient = new IAMClient();
+
+          exports.handler = async (event, context) => {
+            console.log('Event:', JSON.stringify(event, null, 2));
+            
+            try {
+              if (event.RequestType === 'Delete') {
+                return await sendResponse(event, context, 'SUCCESS');
+              }
+              
+              const url = event.ResourceProperties.Url;
+              const clientIds = event.ResourceProperties.ClientIdList || [];
+              const thumbprints = event.ResourceProperties.ThumbprintList || [];
+              
+              // Check if provider exists
+              let providerArn = null;
+              
+              try {
+                const listCommand = new ListOpenIDConnectProvidersCommand({});
+                const providers = await iamClient.send(listCommand);
+                
+                for (const provider of providers.OpenIDConnectProviderList || []) {
+                  try {
+                    const getCommand = new GetOpenIDConnectProviderCommand({ 
+                      OpenIDConnectProviderArn: provider.Arn 
+                    });
+                    const details = await iamClient.send(getCommand);
+                    
+                    if (details.Url === url.replace('https://', '')) {
+                      // Provider exists, return ARN
+                      providerArn = provider.Arn;
+                      console.log(`Found existing provider: ${providerArn}`);
+                      break;
+                    }
+                  } catch (e) {
+                    console.log(`Error getting provider details: ${e.message}`);
+                    continue;
+                  }
+                }
+              } catch (e) {
+                console.log(`Error listing providers: ${e.message}`);
+              }
+              
+              // Create provider if not exists
+              if (!providerArn) {
+                console.log(`Creating new OIDC provider with URL ${url}`);
+                try {
+                  const createCommand = new CreateOpenIDConnectProviderCommand({
+                    Url: url,
+                    ClientIDList: clientIds,
+                    ThumbprintList: thumbprints
+                  });
+                  
+                  const result = await iamClient.send(createCommand);
+                  providerArn = result.OpenIDConnectProviderArn;
+                  console.log(`Created new provider: ${providerArn}`);
+                } catch (e) {
+                  console.log(`Error creating provider: ${e.message}`);
+                  throw e;
+                }
+              }
+              
+              // Extract the account ID and provider name from the ARN
+              const arnParts = providerArn.split(':');
+              const accountId = arnParts[4];
+              const providerName = arnParts[5].replace('oidc-provider/', '');
+              
+              return await sendResponse(event, context, 'SUCCESS', {
+                Arn: providerArn,
+                Url: url,
+                ProviderName: providerName,
+                AccountId: accountId
+              });
+            } catch (error) {
+              console.log('Error:', error);
+              return await sendResponse(event, context, 'FAILED', null, error.message);
+            }
+          };
+
+          async function sendResponse(event, context, status, data = {}, reason = '') {
+            const responseBody = {
+              Status: status,
+              Reason: reason,
+              PhysicalResourceId: event.PhysicalResourceId || event.LogicalResourceId || context.logGroupName,
+              StackId: event.StackId,
+              RequestId: event.RequestId,
+              LogicalResourceId: event.LogicalResourceId,
+              Data: data
+            };
+            
+            console.log('Response:', JSON.stringify(responseBody, null, 2));
+            
+            const https = require('https');
+            const url = require('url');
+            
+            return new Promise((resolve, reject) => {
+              if (!event.ResponseURL) {
+                console.log('No ResponseURL found in event, returning data directly');
+                resolve(data);
+                return;
+              }
+              
+              const parsedUrl = url.parse(event.ResponseURL);
+              const options = {
+                hostname: parsedUrl.hostname,
+                port: 443,
+                path: parsedUrl.path,
+                method: 'PUT',
+                headers: {
+                  'Content-Type': '',
+                  'Content-Length': Buffer.byteLength(JSON.stringify(responseBody))
+                }
+              };
+              
+              const req = https.request(options, (res) => {
+                res.on('data', () => {});
+                res.on('end', () => {
+                  resolve();
+                });
+              });
+              
+              req.on('error', (error) => {
+                console.error('Error sending response:', error);
+                reject(error);
+              });
+              
+              req.write(JSON.stringify(responseBody));
+              req.end();
+            });
+          };
+
+  GitHubOIDCProvider:
+    Type: Custom::OIDCProvider
+    Properties:
+      ServiceToken: !GetAtt GitHubOIDCProviderFunction.Arn
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: !Ref AudienceList
+      ThumbprintList: !Ref ThumbprintList
+
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DailyBackupRetention
+            Status: Enabled
+            Prefix: daily/
+            ExpirationInDays: !Ref DailyBackupRetentionDays
+          - Id: WeeklyBackupRetention
+            Status: Enabled
+            Prefix: weekly/
+            ExpirationInDays: !Ref WeeklyBackupRetentionDays
+          - Id: DeletedObjectRetention
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 90
+            ExpiredObjectDeleteMarker: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  BackupBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BackupBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyObjectDelete
+            Effect: Deny
+            Principal: "*"
+            Action:
+              - s3:DeleteObject
+              - s3:DeleteObjectVersion
+            Resource: !Sub "${BackupBucket.Arn}/*"
+          - Sid: DenyBucketDelete
+            Effect: Deny
+            Principal: "*"
+            Action: s3:DeleteBucket
+            Resource: !GetAtt BackupBucket.Arn
+          - Sid: RequireSSL
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt BackupBucket.Arn
+              - !Sub "${BackupBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  GitHubActionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !GetAtt GitHubOIDCProvider.Arn
+            Action: "sts:AssumeRoleWithWebIdentity"
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud:
+                  !Select [0, !Ref AudienceList]
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubRepositoryName}:*"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"
+      Policies:
+        - PolicyName: GitHubRepoBackupPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:PutObject"
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                Resource:
+                  - !GetAtt BackupBucket.Arn
+                  - !Sub "${BackupBucket.Arn}/*"
+
+  # Lambda execution role
+  WorkflowUploaderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub arn:aws:s3:::${BackupBucket}/*
+
+  # Lambda function to create the workflow file in S3
+  WorkflowUploaderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: nodejs22.x
+      Role: !GetAtt WorkflowUploaderRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+          const s3Client = new S3Client();
+
+          exports.handler = async (event, context) => {
+            console.log('Event:', JSON.stringify(event, null, 2));
+            
+            try {
+              if (event.RequestType === 'Delete') {
+                // We don't delete the file on stack deletion to preserve backups
+                return await sendResponse(event, context, 'SUCCESS');
+              }
+              
+              const { BucketName, WorkflowContent, FilePath } = event.ResourceProperties;
+              
+              // Upload the workflow file to S3
+              const putCommand = new PutObjectCommand({
+                Bucket: BucketName,
+                Key: FilePath,
+                Body: WorkflowContent,
+                ContentType: 'text/yaml'
+              });
+              
+              await s3Client.send(putCommand);
+              
+              const s3Uri = `s3://${BucketName}/${FilePath}`;
+              
+              return await sendResponse(event, context, 'SUCCESS', {
+                S3Uri: s3Uri
+              });
+            } catch (error) {
+              console.error('Error:', error);
+              return await sendResponse(event, context, 'FAILED', null, error.message);
+            }
+          };
+
+          async function sendResponse(event, context, status, data = {}, reason = '') {
+            const responseBody = {
+              Status: status,
+              Reason: reason,
+              PhysicalResourceId: event.PhysicalResourceId || event.LogicalResourceId || context.logGroupName,
+              StackId: event.StackId,
+              RequestId: event.RequestId,
+              LogicalResourceId: event.LogicalResourceId,
+              Data: data
+            };
+            
+            console.log('Response:', JSON.stringify(responseBody, null, 2));
+            
+            const https = require('https');
+            const url = require('url');
+            
+            return new Promise((resolve, reject) => {
+              if (!event.ResponseURL) {
+                console.log('No ResponseURL found in event, returning data directly');
+                resolve(data);
+                return;
+              }
+              
+              const parsedUrl = url.parse(event.ResponseURL);
+              const options = {
+                hostname: parsedUrl.hostname,
+                port: 443,
+                path: parsedUrl.path,
+                method: 'PUT',
+                headers: {
+                  'Content-Type': '',
+                  'Content-Length': Buffer.byteLength(JSON.stringify(responseBody))
+                }
+              };
+              
+              const req = https.request(options, (res) => {
+                res.on('data', () => {});
+                res.on('end', () => {
+                  resolve();
+                });
+              });
+              
+              req.on('error', (error) => {
+                console.error('Error sending response:', error);
+                reject(error);
+              });
+              
+              req.write(JSON.stringify(responseBody));
+              req.end();
+            });
+          }
+
+  # Custom resource to invoke the Lambda function
+  WorkflowUploader:
+    Type: Custom::S3FileCreator
+    Properties:
+      ServiceToken: !GetAtt WorkflowUploaderFunction.Arn
+      BucketName: !Ref BackupBucket
+      FilePath: github-workflow.yaml
+      WorkflowContent: !Sub |
+        name: GitSnap - Regular Scheduled Backup
+        on:
+          schedule:
+            - cron: "0 0 * * *" # Runs daily at midnight UTC
+          workflow_dispatch: # Allows manual triggering
+        jobs:
+          backup:
+            runs-on: ubuntu-latest
+            permissions:
+              id-token: write
+              contents: read
+            steps:
+              - name: Checkout Repository
+                uses: actions/checkout@v4
+                with:
+                  fetch-depth: 0
+
+              - name: Fetch All Branches and Tags and Create Local Tracking Branches
+                run: |
+                    # More comprehensive approach to fetch all branches
+                    git fetch --all --force
+                    git fetch --tags --force
+
+                    # List all remote branches for verification
+                    echo "Remote branches found:"
+                    git branch -r
+
+                    # Create local tracking branches for all remote branches
+                    echo "Creating local tracking branches..."
+                    git branch -r | grep -v '\->' | while read remote; do
+                      branch_name=$(echo "$remote" | sed 's|origin/||')
+                      if [ "$branch_name" != "HEAD" ]; then
+                        git branch --track "$branch_name" "$remote" || echo "Already exists: $branch_name"
+                      fi
+                    done
+
+                    # List all local branches after creation
+                    echo "Local branches created:"
+                    git branch
+
+              - name: Configure AWS Credentials
+                uses: aws-actions/configure-aws-credentials@v4
+                with:
+                  role-to-assume: ${GitHubActionsRole.Arn}
+                  aws-region: ${AWS::Region}
+
+              - name: Set up Git
+                run: |
+                  git config --global user.name "GitHub Actions"
+                  git config --global user.email "actions@github.com"
+
+              - name: Create Repository Backup
+                run: |
+                  # Get current timestamp
+                  TIMESTAMP=$(date -u +%Y%m%d%H%M%S)
+                  # Get date components
+                  YEAR=$(date -u +%Y)
+                  MONTH=$(date -u +%m)
+                  DAY=$(date -u +%d)
+                  WEEKDAY=$(date -u +%A)
+
+                  # Create 7z archive of the entire repository (including .git folder)
+                  7z a repo-backup.7z .
+
+                  # Daily backup path
+                  DAILY_PATH="daily/$YEAR/$MONTH/$DAY/$TIMESTAMP.7z"
+                  # Upload daily backup
+                  aws s3 cp repo-backup.7z s3://${BackupBucket}/$DAILY_PATH
+
+                  # Weekly backup on Sunday
+                  if [ "$WEEKDAY" = "Sunday" ]; then
+                    WEEKLY_PATH="weekly/$YEAR/$MONTH/$DAY/$TIMESTAMP.7z"
+                    aws s3 cp repo-backup.7z s3://${BackupBucket}/$WEEKLY_PATH
+                  fi
+
+              - name: Clean up
+                run: |
+                  rm -f repo-backup.7z
+
+Outputs:
+  GitHubActionsWorkflow:
+    Description: GitHub Actions workflow to sync daily and weekly repository snapshots
+    Value:
+      Fn::Sub: s3://${BackupBucket}/github-workflow.yaml
+  BucketName:
+    Description: Name of the S3 bucket created
+    Value: !Ref BackupBucket
+  RoleArn:
+    Description: ARN of the IAM role for GitHub Actions
+    Value: !GetAtt GitHubActionsRole.Arn
