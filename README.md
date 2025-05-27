@@ -72,7 +72,7 @@ Deploy the CloudFormation stack in your AWS Account - via the UI is fine.
 
 The CloudFormation stack will write a github-workflow.yaml to the S3 bucket.  
 
-Download this, and upload as-is to your `./github/workflows` directiry in your repository 
+Download this, and upload as-is to your `./.github/workflows` directiry in your repository 
 
 #### 4️⃣ Run your first backup
 
